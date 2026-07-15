@@ -7,11 +7,12 @@ __pycache__/
 backend/__pycache__/
 backend/dump_raw.py
 backend/raw_output.json
-test-docs/test.docx
+test-docs/
 .gitignore
 test-docs/test.docx
 test-docs/~$test.docx
 backend/workspace/current.docx
+backend/workspace/style_specs.sqlite3
 test-docs/test.docx
 backend/prompts/system_prompt - 副本.txt
 test-docs/test.docx
@@ -21,3 +22,8 @@ backend/retriever_chroma.py
 test-docs/实验报告模板.docx
 test-docs/实验报告模板.docx
 docs.txt
+config/
+config/codex.sqlite3
+config/codex.toml
+config/logs/codex.log
+test-docs/24201722_龙亮宇_实验2.docx

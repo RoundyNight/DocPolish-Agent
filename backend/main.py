@@ -2,7 +2,7 @@ import json
 import os
 import uuid
 import subprocess
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse, FileResponse
@@ -14,6 +14,11 @@ import httpx
 from agent import agent_graph
 from langgraph.types import Command
 from langchain_core.messages import AIMessage, ToolMessage
+from template_ingest import ingest_template, reassemble_with_corrections
+from spec_store import (
+    set_active_spec, get_spec, list_all_specs, register_dynamic_spec,
+    delete_dynamic_spec,
+)
 
 app = FastAPI(title="AI Document Agent Backend")
 
@@ -139,13 +144,21 @@ class ExecuteRequest(BaseModel):
 class AgentStartRequest(BaseModel):
     api_key: str
     model: str
-    dehydrated_data: list
+    dehydrated_data: dict
     message: str
+    spec_id: str = "general"
 
 class AgentContinueRequest(BaseModel):
     thread_id: str = Field(..., description="Agent 会话线程ID")
     decision: str = Field(..., description="approve 或 revise")
     feedback: str = Field(default="", description="修订意见（decision=revise 时必填）")
+
+class SpecConfirmRequest(BaseModel):
+    spec_id: str
+    corrections: dict[int, str] = Field(default_factory=dict, description="index→新角色 修正")
+    activate: bool = True
+    save: bool = False
+    name: str = Field(default="", max_length=80)
 
 # ---------- Agent SSE 辅助 ----------
 STEP_LABELS = {
@@ -192,12 +205,11 @@ async def chat_with_ai(req: ChatRequest):
                 if raw_nodes:
                     baseline = calculate_dynamic_baseline(raw_nodes)
                     label_map = {
-                        "effective.font.eastAsia": "中文字体",
-                        "effective.font.ascii": "西文字体",
-                        "effective.size": "字号",
-                        "effective.bold": "加粗",
-                        "effective.italic": "斜体",
-                        "effective.color": "颜色",
+                        "font_east_asia": "中文字体",
+                        "font_ascii": "西文字体",
+                        "font_size": "字号",
+                        "bold": "加粗",
+                        "color": "颜色",
                     }
                     parts = []
                     for key, label in label_map.items():
@@ -326,10 +338,12 @@ async def agent_start(req: AgentStartRequest):
         "doc_path": doc_path,
         "baseline_text": "",
         "template_prompt": "",
+        "role_catalog": "",
         "human_decision": "",
         "human_feedback": "",
         "current_step": "",
         "error": "",
+        "spec_id": req.spec_id,
         "messages": [],  # add_messages reducer 起始为空列表
     }
 
@@ -423,3 +437,79 @@ async def agent_continue(req: AgentContinueRequest):
             yield format_sse("error", {"message": str(e), "thread_id": req.thread_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+# ---------- 规范管理路由 (S2 模板逆向) ----------
+@app.post("/api/spec/upload-template")
+async def upload_template_spec(
+    file: UploadFile = File(...),
+    api_key: str = Form(""),
+    model: str = Form("deepseek-chat"),
+    domain: str = Form("上传模板"),
+):
+    """上传模板文档, 逆向出 StyleSpec, 返回审核预览(不自动激活)。"""
+    if not file.filename.endswith(".docx"):
+        raise HTTPException(status_code=400, detail="只支持 .docx 模板文件")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="需要 api_key 调用 LLM 进行角色分类")
+    try:
+        # 保存模板到临时路径
+        tmp_path = os.path.join(WORKSPACE_DIR, f"_template_{uuid.uuid4().hex[:8]}.docx")
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        # officecli 解析
+        raw_json = parse_doc_with_officecli(tmp_path)
+        os.remove(tmp_path)  # 解析完即删, 不占空间
+        # 模板逆向管线
+        spec, preview = ingest_template(raw_json, api_key, model, domain)
+        return {"status": "success", "preview": preview}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"模板逆向失败: {str(e)}")
+
+@app.post("/api/spec/confirm")
+async def confirm_spec(req: SpecConfirmRequest):
+    """确认激活规范；模板仅在 save=true 时命名并持久化。"""
+    try:
+        if req.corrections:
+            spec, preview = reassemble_with_corrections(req.spec_id, req.corrections)
+        else:
+            spec = get_spec(req.spec_id)
+            if spec is None:
+                raise HTTPException(status_code=404, detail=f"找不到规范: {req.spec_id}; 可用: {list_all_specs()}")
+            preview = None
+        if req.save:
+            name = req.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="保存模板时必须填写模板名称")
+            spec.domain = name
+            register_dynamic_spec(spec, persist=True)
+        if req.activate:
+            set_active_spec(req.spec_id)
+        return {"status": "success", "spec_id": req.spec_id, "domain": spec.domain,
+                "activated": req.activate, "saved": req.save, "preview": preview}
+    except HTTPException:
+        raise
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"确认规范失败: {str(e)}")
+
+@app.get("/api/spec/list")
+def list_specs():
+    """列出预置及用户明确保存的动态规范。"""
+    spec_ids = list_all_specs()
+    details = {spec_id: get_spec(spec_id).domain for spec_id in spec_ids if get_spec(spec_id)}
+    return {"status": "success", "specs": spec_ids, "spec_details": details}
+
+
+@app.delete("/api/spec/{spec_id}")
+def delete_spec(spec_id: str):
+    """删除用户模板；系统预置规范受保护。"""
+    try:
+        if not delete_dynamic_spec(spec_id):
+            raise HTTPException(status_code=404, detail=f"找不到模板: {spec_id}")
+        return {"status": "success", "spec_id": spec_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

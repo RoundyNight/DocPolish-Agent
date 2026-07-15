@@ -22,13 +22,27 @@
                 </div>
             </div>
 
-            <div class="chat-panel">
+            <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-label="调整侧边栏宽度" aria-orientation="vertical" tabindex="0"></div>
+            <div id="chatPanel" class="chat-panel">
                 <div class="chat-header">
                     <h3>AI 排版助手</h3>
                 </div>
                 <div class="chat-config">
                     <input type="password" id="apiKey" placeholder="DeepSeek API Key">
                     <button id="testConnBtn" class="btn-link">测试连接</button>
+                </div>
+                <div class="spec-config">
+                    <select id="specSelect" hidden aria-hidden="true">
+                        <option value="general">通用规范</option>
+                        <option value="academic_gb">学术论文</option>
+                    </select>
+                    <div id="specDropdown" class="spec-dropdown">
+                        <button id="specDropdownTrigger" class="spec-dropdown-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+                            <span id="specDropdownLabel">通用规范</span><span class="spec-chevron">⌄</span>
+                        </button>
+                        <div id="specDropdownMenu" class="spec-dropdown-menu" role="listbox" hidden></div>
+                    </div>
+                    <button id="refreshSpecBtn" class="btn-link" title="刷新规范列表">↻</button>
                 </div>
                 <div id="statusBar" class="status-bar idle" style="display:none"></div>
                 <div class="chat-messages" id="chatMessages">
@@ -38,11 +52,36 @@
         </div>
 
         <div class="floating-input-bar">
+            <div id="attachmentShelf" class="attachment-shelf" aria-live="polite" hidden>
+                <div id="documentAttachment" class="attachment-card" hidden>
+                    <span class="attachment-icon">W</span>
+                    <span class="attachment-copy"><b>待排版文档</b><span id="documentFileName"></span></span>
+                    <span class="attachment-state">已解析</span>
+                </div>
+                <div id="templateAttachment" class="attachment-card template" hidden>
+                    <span class="attachment-icon">T</span>
+                    <span class="attachment-copy"><b>排版模板</b><span id="templateFileName"></span></span>
+                    <span class="attachment-state">已逆向</span>
+                </div>
+            </div>
             <div class="input-row">
                 <input type="file" id="uploadInput" accept=".docx" hidden>
-                <button id="uploadBtn" class="upload-pill-btn" title="上传文档">+</button>
+                <input type="file" id="templateInput" accept=".docx" hidden>
+                <div id="uploadChooser" class="upload-chooser">
+                    <div class="upload-menu" role="radiogroup" aria-label="选择上传类型">
+                        <label class="upload-option">
+                            <input type="radio" name="uploadType" value="document" checked>
+                            <span><b>上传需排版的文档</b><small>上传后进行解析和预览</small></span>
+                        </label>
+                        <label class="upload-option">
+                            <input type="radio" name="uploadType" value="template">
+                            <span><b>上传模板</b><small>逆向提取模板排版规范</small></span>
+                        </label>
+                    </div>
+                    <button id="uploadBtn" class="upload-pill-btn" title="上传需排版的文档" aria-label="选择并上传文档" aria-haspopup="true">+</button>
+                </div>
                 <div class="input-wrapper">
-                    <input type="text" id="userInput" placeholder="点击"+"上传文档" readonly>
+                    <input type="text" id="userInput" placeholder="点击“+”上传文档" readonly>
                 </div>
                 <select id="model" class="model-select">
                     <option value="deepseek-chat">deepseek-chat</option>

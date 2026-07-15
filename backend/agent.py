@@ -18,8 +18,8 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_openai import ChatOpenAI
 
 from dehydrator import calculate_dynamic_baseline
-from retriever import match_template
 from doc_tools import all_tools
+from spec_store import set_active_spec, get_active_spec
 
 # ---------- 系统提示词 ----------
 PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
@@ -38,9 +38,17 @@ _GLOBAL_INTENT_KEYWORDS = ("优化", "排版", "格式", "全文", "整体", "�
 def _is_global_intent(user_message: str) -> bool:
     return any(kw in user_message for kw in _GLOBAL_INTENT_KEYWORDS)
 
-def _build_doc_structure_hint(dehydrated_data: list, user_message: str) -> str:
+def _dehydrated_paragraphs(dehydrated_data) -> list:
+    """从脱水结果取正文段落列表(兼容 v2 dict 与旧 list)。"""
+    if isinstance(dehydrated_data, dict):
+        return dehydrated_data.get("paragraphs", [])
+    if isinstance(dehydrated_data, list):
+        return [item for item in dehydrated_data if isinstance(item, dict) and "index" in item]
+    return []
+
+def _build_doc_structure_hint(dehydrated_data, user_message: str) -> str:
     """为规划阶段注入段落规模与非空预览，避免全局指令只改 index 0。"""
-    indexed = [item for item in dehydrated_data if isinstance(item, dict) and "index" in item]
+    indexed = [item for item in _dehydrated_paragraphs(dehydrated_data) if isinstance(item, dict) and "index" in item]
     if not indexed:
         return ""
     count = len(indexed)
@@ -70,8 +78,8 @@ def _last_ai_with_tool_calls(messages: list) -> AIMessage | None:
             return m
     return None
 
-def _indexed_paragraph_count(dehydrated_data: list) -> int:
-    return sum(1 for item in dehydrated_data if isinstance(item, dict) and "index" in item)
+def _indexed_paragraph_count(dehydrated_data) -> int:
+    return sum(1 for item in _dehydrated_paragraphs(dehydrated_data) if isinstance(item, dict) and "index" in item)
 
 def _tool_call_args(tc: dict) -> dict:
     """兼容 AIMessage.tool_calls 与 JSON 中的 arguments 字段。"""
@@ -144,7 +152,7 @@ def _global_plan_too_narrow(state: "AgentState", response: AIMessage) -> tuple[b
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]  # LangChain BaseMessage 列表(对话+tool_calls)
     user_message: str
-    dehydrated_data: list
+    dehydrated_data: dict
     api_key: str
     model: str
     doc_path: str
@@ -154,10 +162,22 @@ class AgentState(TypedDict):
     human_feedback: str
     current_step: str
     error: str
+    spec_id: str
+    role_catalog: str
+
+# ---------- 规范角色目录(动态注入) ----------
+def _render_role_catalog(spec) -> str:
+    """从激活的 StyleSpec 动态拼装角色目录, 注入 plan_formatting 的 user_content。"""
+    lines = [f"当前激活排版规范: {spec.domain}"]
+    lines.append("可用角色(优先用 apply_role_style 按角色批量应用, 相同角色 para_index 必须合并):")
+    for role_id, rdef in spec.roles.items():
+        comp = " [复合段落: 引题/内容分别格式化]" if rdef.composite else ""
+        lines.append(f"- {role_id}: {rdef.label}。识别线索: {rdef.hints}{comp}")
+    return "\n".join(lines) + "\n\n"
 
 # ---------- Node: analyze_document ----------
 async def analyze_document(state: AgentState) -> dict:
-    """读取文档结构,计算基准线,匹配排版模板"""
+    """读取文档结构,计算基准线,激活规范并注入角色目录"""
     doc_path = state.get("doc_path", "")
     baseline_text = ""
 
@@ -172,12 +192,11 @@ async def analyze_document(state: AgentState) -> dict:
                 if raw_nodes:
                     baseline = calculate_dynamic_baseline(raw_nodes)
                     label_map = {
-                        "effective.font.eastAsia": "中文字体",
-                        "effective.font.ascii": "西文字体",
-                        "effective.size": "字号",
-                        "effective.bold": "加粗",
-                        "effective.italic": "斜体",
-                        "effective.color": "颜色",
+                        "font_east_asia": "中文字体",
+                        "font_ascii": "西文字体",
+                        "font_size": "字号",
+                        "bold": "加粗",
+                        "color": "颜色",
                     }
                     parts = []
                     for key, label in label_map.items():
@@ -191,20 +210,26 @@ async def analyze_document(state: AgentState) -> dict:
     except Exception:
         pass
 
-    matched_content = match_template(state["user_message"])
+    # 激活排版规范, 构建角色目录(规范驱动主路径)
+    spec_id = state.get("spec_id", "general")
+    role_catalog = ""
     template_prompt = ""
-    if matched_content:
-        template_prompt = (
-            "用户指定了如下排版规范（若用户未明确指定，则为系统默认的通用规范），请严格遵循所有细节，逐条转换为工具调用。\n"
-            "请根据文档的语义（如\"摘要\"二字、标题层级编号）来识别段落角色并执行对应设置。\n"
-            f"【排版规范】：\n{matched_content}\n\n"
-        )
-    else:
-        template_prompt = "用户未指定特定排版规范，请根据通用美观原则排版。\n"
+    try:
+        spec = set_active_spec(spec_id)
+    except Exception as e:
+        return {
+            "baseline_text": baseline_text,
+            "template_prompt": "",
+            "role_catalog": "",
+            "current_step": "error",
+            "error": f"无法激活排版规范 {spec_id}: {e}",
+        }
+    role_catalog = _render_role_catalog(spec)
 
     return {
         "baseline_text": baseline_text,
         "template_prompt": template_prompt,
+        "role_catalog": role_catalog,
         "current_step": "analyze_done",
         "error": "",
     }
@@ -219,10 +244,11 @@ async def plan_formatting(state: AgentState) -> dict:
         structure_hint = _build_doc_structure_hint(state["dehydrated_data"], state["user_message"])
         user_content = (
             f"{state.get('baseline_text', '')}"
+            f"{state.get('role_catalog', '')}"
             f"{state.get('template_prompt', '')}"
             f"{structure_hint}"
-            f"以下是用户的文档结构（文本已截断，请重点关注 index 和样式）：\n"
-            f"```json\n{json.dumps(state['dehydrated_data'], ensure_ascii=False, indent=2)}\n```\n\n"
+            f"以下是用户的文档段落（文本已截断，请重点关注 index、style 和样式差异）：\n"
+            f"```json\n{json.dumps(_dehydrated_paragraphs(state['dehydrated_data']), ensure_ascii=False, indent=2)}\n```\n\n"
             f"以下是用户需求：{state['user_message']}\n请生成操作指令。"
         )
         new_messages = [
@@ -373,6 +399,11 @@ def route_after_review(state: AgentState) -> Literal["execute_tools", "plan_form
         return "execute_tools"
     return "plan_formatting"
 
+
+def route_after_analysis(state: AgentState) -> Literal["plan_formatting", "end"]:
+    """规范激活失败时立即结束，避免继续调用 LLM 或静默套用其他模板。"""
+    return "end" if state.get("error") else "plan_formatting"
+
 # ---------- Build Graph ----------
 def build_agent_graph():
     builder = StateGraph(AgentState)
@@ -383,7 +414,11 @@ def build_agent_graph():
     builder.add_node("execute_tools", execute_tools)
 
     builder.add_edge(START, "analyze_document")
-    builder.add_edge("analyze_document", "plan_formatting")
+    builder.add_conditional_edges(
+        "analyze_document",
+        route_after_analysis,
+        {"plan_formatting": "plan_formatting", "end": END},
+    )
     builder.add_edge("plan_formatting", "human_review")
     builder.add_conditional_edges("human_review", route_after_review)
     builder.add_edge("execute_tools", END)
